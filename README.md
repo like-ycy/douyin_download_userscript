@@ -1,10 +1,12 @@
 # 抖音画质探测与下载
 
-[![Greasy Fork](https://img.shields.io/badge/Greasy%20Fork-安装脚本-red)](https://greasyfork.org/zh-CN/scripts/600007-%E6%8A%96%E9%9F%B3%E7%94%BB%E8%B4%A8%E6%8E%A2%E6%B5%8B%E4%B8%8E%E4%B8%8B%E8%BD%BD)
+[![Greasy Fork](https://img.shields.io/badge/Greasy%20Fork-安装脚本-red)](https://greasyfork.org/zh-CN/scripts/600007-%E6%8A%96%E9%9F%B3%E7%94%BB%E8%B4%A8%E6%8E%A2%E6%B5%8B%E4%B8%8E%E4%B8%8B%E8%BD%BD) [![GitHub](https://img.shields.io/badge/GitHub-源码仓库-181717?logo=github)](https://github.com/like-ycy/douyin_download_userscript) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 在抖音网页版点击下载图标，自动获取**当前正在看的视频**的画质、实际分辨率和文件大小，再选择版本下载。
 
-当前版本：**0.1.7**。适用于桌面 Chrome / Edge 与 Tampermonkey（油猴），无需 Python、独立浏览器或后台服务。
+当前版本：**0.1.8**。适用于桌面 Chrome / Edge 与 Tampermonkey（油猴），无需 Python、独立浏览器或后台服务。
+
+源码仓库：<https://github.com/like-ycy/douyin_download_userscript> —— 欢迎 Star；想修改或二次开发请直接打开该地址，问题反馈可提交 [Issue](https://github.com/like-ycy/douyin_download_userscript/issues)。
 
 ![效果示例：面板跟随下载图标弹出，展示各档位画质、分辨率与真实大小](assets/panel-example.png)
 
@@ -47,7 +49,7 @@
 
 ## 常见问题
 
-- **保存后图标还是旧的**：确认油猴中的已安装版本为 `0.1.7`，并刷新抖音页面。通过 Greasy Fork 安装时，等待油猴自动更新或在其页面手动点击更新。
+- **保存后图标还是旧的**：确认油猴中的已安装版本为 `0.1.8`，并刷新抖音页面。通过 Greasy Fork 安装时，等待油猴自动更新或在其页面手动点击更新。
 - **首屏或某条视频没有识别出来**：脚本同时读取页面内嵌的 RSC 数据和后续网络响应；当前卡片由 `data-e2e-vid` 标识。点击后最多等待 10 秒，仍失败时刷新页面重试。
 - **某些画质失败**：展开「查看未成功的探测」。CDN 可能拒绝部分版本，已成功的版本仍可以下载。
 - **下载地址过期**：刷新页面并重新探测。移动端档位下载前会重新获取签名地址。

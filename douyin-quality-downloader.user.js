@@ -1,8 +1,13 @@
 // ==UserScript==
 // @name         抖音画质探测与下载
 // @namespace    douyin-quality-downloader
-// @version      0.1.7
+// @version      0.1.8
 // @description  点击当前播放视频上的下载图标，自动探测画质并下载。
+// @author       like-ycy
+// @license      MIT
+// @homepageURL  https://github.com/like-ycy/douyin_download_userscript
+// @supportURL   https://github.com/like-ycy/douyin_download_userscript/issues
+// @icon         https://www.douyin.com/favicon.ico
 // @match        https://www.douyin.com/*
 // @run-at       document-start
 // @sandbox      raw
