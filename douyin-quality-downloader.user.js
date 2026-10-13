@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         抖音画质探测与下载
 // @namespace    douyin-quality-downloader
-// @version      0.1.6
+// @version      0.1.7
 // @description  点击当前播放视频上的下载图标，自动探测画质并下载。
 // @match        https://www.douyin.com/*
 // @run-at       document-start
@@ -19,6 +19,7 @@
 // @connect      bytecdn.cn
 // @connect      ibytedtos.com
 // @connect      byteimg.com
+// @license      MIT
 // ==/UserScript==
 
 (() => {
@@ -610,7 +611,7 @@
     return element;
   }
 
-  function enableIconDragging(button) {
+  function enableIconDragging(button, onMoved) {
     const storageKey = 'download-icon-position';
     const stored = GM_getValue(storageKey, null);
     let position = stored && [stored.x, stored.y].every(value => Number.isFinite(value) && value >= 0 && value <= 1)
@@ -639,6 +640,7 @@
       } else if (video) {
         place(video.box.right - 58, video.box.top + video.box.height * 0.56 - 23);
       }
+      onMoved?.();
     };
     button.addEventListener('pointerdown', event => {
       if (event.button !== 0 || event.isPrimary === false) return;
@@ -655,6 +657,7 @@
       drag.moved = true; suppressClick = true;
       event.preventDefault(); event.stopPropagation();
       place(drag.left + dx, drag.top + dy);
+      onMoved?.();
     });
     const finish = (event, cancelled) => {
       if (!drag || event.pointerId !== drag.id) return;
@@ -671,6 +674,30 @@
     button.addEventListener('pointercancel', event => finish(event, true));
     button.addEventListener('lostpointercapture', event => finish(event, true));
     return { update, ignoreClick: event => event.detail !== 0 && suppressClick };
+  }
+
+  // 面板不固定在右下角，而是锚定下载图标：图标在上半屏向下弹出，在下半屏向上弹出；放不下时换另一侧。
+  function placePanel() {
+    if (!ui || ui.panel.hidden || ui.button.hidden) return;
+    const { panel, button } = ui;
+    const icon = button.getBoundingClientRect();
+    const width = panel.offsetWidth, height = panel.offsetHeight;
+    if (!width || !height) return;
+    const margin = 10, edge = 8;
+    const left = Math.min(Math.max(edge, icon.left + icon.width / 2 - width / 2), Math.max(edge, innerWidth - width - edge));
+    const downward = icon.top + icon.height / 2 <= innerHeight / 2;
+    const belowTop = icon.bottom + margin;
+    const aboveTop = icon.top - margin - height;
+    const minTop = edge;
+    const maxTop = Math.max(minTop, innerHeight - height - edge);
+    let top = downward ? belowTop : aboveTop;
+    if (top < minTop || top > maxTop) {
+      const flip = downward ? aboveTop : belowTop;
+      if (flip >= minTop && flip <= maxTop) top = flip;
+    }
+    top = Math.min(Math.max(minTop, top), maxTop);
+    panel.style.left = `${left}px`;
+    panel.style.top = `${top}px`;
   }
 
   function render() {
@@ -710,6 +737,7 @@
       : '当前视频未取得可下载版本，请检查登录状态和油猴跨域授权。';
     ui.cancel.hidden = !download;
     if (download) ui.downloadMessage.textContent = `${download.name}：${humanSize(download.loaded)} / ${humanSize(download.total)}`;
+    placePanel();
   }
 
   function mount() {
@@ -724,7 +752,7 @@
       .video-action{position:fixed;width:46px;height:46px;display:grid;place-items:center;border:1px solid #ffffff55;border-radius:50%;background:#191b22d9;box-shadow:0 2px 10px #0008;padding:0;touch-action:none;user-select:none;cursor:grab}
       .video-action:active{cursor:grabbing}
       .video-action svg{width:23px;height:23px;fill:none;stroke:#fff;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
-      .panel{position:fixed;right:76px;bottom:20px;width:min(580px,calc(100vw - 96px));max-height:76vh;overflow:auto;background:#1b1d25;border:1px solid #414452;border-radius:10px;padding:16px;box-shadow:0 8px 32px #0008}
+      .panel{position:fixed;left:0;top:0;width:min(580px,calc(100vw - 16px));max-height:76vh;overflow:auto;background:#1b1d25;border:1px solid #414452;border-radius:10px;padding:16px;box-shadow:0 8px 32px #0008}
       [hidden]{display:none!important}.head,.actions{display:flex;gap:8px;align-items:center}.head{justify-content:space-between}h2{font-size:17px;margin:0}p{margin:10px 0;overflow-wrap:anywhere}
       .title{color:#cbd0dc;max-height:72px;overflow:auto}
       table{width:100%;border-collapse:collapse;margin-top:12px;font-size:13px}th,td{text-align:left;border-bottom:1px solid #383c49;padding:9px 4px}small{display:block;color:#9fa9bc;font-size:11px}
@@ -732,7 +760,6 @@
     `;
     const panel = node('section', undefined, 'panel'); panel.hidden = true;
     const head = node('div', undefined, 'head'); head.append(node('h2', '抖音视频下载'));
-    const close = node('button', '收起'); close.addEventListener('click', () => { panel.hidden = true; }); head.append(close);
     const status = node('p');
     const title = node('p', undefined, 'title');
     const actions = node('div', undefined, 'actions');
@@ -757,14 +784,18 @@
     path.setAttribute('d', 'M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3'); icon.append(path);
     const button = node('button', undefined, 'video-action');
     button.type = 'button'; button.title = '点击下载当前视频，拖动调整位置'; button.setAttribute('aria-label', '探测并下载当前视频'); button.append(icon);
-    const dragging = enableIconDragging(button);
+    const dragging = enableIconDragging(button, placePanel);
     button.addEventListener('click', event => {
       event.preventDefault(); event.stopPropagation();
       if (dragging.ignoreClick(event)) return;
+      // 再次点击图标收起面板；拖动后的第一次点击不会误触发。
+      if (!panel.hidden) { panel.hidden = true; return; }
       beginCurrentProbe();
+      placePanel();
     });
     shadow.append(style, panel, button); document.documentElement.append(host);
     ui = { panel, button, status, title, stop, rows, empty, diagnostics, errors, downloadMessage, cancel };
+    addEventListener('resize', placePanel);
     GM_registerMenuCommand('下载当前视频', () => button.click());
     syncCurrent = () => {
       const video = currentVideo();
