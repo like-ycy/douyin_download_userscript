@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         抖音画质探测与下载
 // @namespace    douyin-quality-downloader
-// @version      0.2.0
-// @description  下载当前作品：视频画质探测、图集逐张或整组保存。
+// @version      0.3.0
+// @description  下载当前作品：视频画质探测、图集逐张、整组保存或打包为 ZIP。
 // @author       like-ycy
 // @license      MIT
 // @homepageURL  https://github.com/like-ycy/douyin_download_userscript
@@ -605,12 +605,16 @@
     return result.replace(/[ .]+$/g, '');
   }
 
-  function filename(item, row) {
+  function baseName(item, fallback) {
     const author = clipFilename(cleanFilenamePart(item.author?.nickname), 20, 60);
     const title = cleanFilenamePart((item.desc || '').replace(/#[^\s#]+/g, '').replace(/#/g, ''));
-    let base = author && title ? `${author} - ${title}` : title || `douyin_${workId(item.aweme_id) || 'video'}`;
+    let base = author && title ? `${author} - ${title}` : title || fallback;
     // Windows 设备名带扩展名也保留；清洗后再次保证不会成为设备名。
     if (/^(CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])(?:\.|$)/i.test(base)) base = `_${base}`;
+    return base;
+  }
+
+  function filename(item, row) {
     const validDimension = value => Number.isSafeInteger(value) && value > 0 && value <= 65535;
     const quality = row.ratio === 'default' ? 'default'
       : validDimension(row.width) && validDimension(row.height) ? `${row.width}x${row.height}` : '未知尺寸';
@@ -620,8 +624,13 @@
       : ` - ${quality}${codec ? ` ${codec}` : ''}.mp4`;
     // 整个文件名（含画质后缀和扩展名）同时限制 UTF-16 长度与 UTF-8 字节数。
     const budget = 200 - new TextEncoder().encode(suffix).length;
-    base = clipFilename(base, 120 - suffix.length, budget) || 'douyin_video';
+    const base = clipFilename(baseName(item, `douyin_${workId(item.aweme_id) || 'video'}`), 120 - suffix.length, budget) || 'douyin_video';
     return base + suffix;
+  }
+
+  function zipName(item) {
+    const base = clipFilename(baseName(item, `douyin_${workId(item.aweme_id) || 'album'}`), 120, 190) || 'douyin_images';
+    return `${base}.zip`;
   }
 
   function saveDownload(item, row, resolved, state) {
@@ -741,6 +750,207 @@
     }
   }
 
+  function fetchBlob(url, state, row) {
+    return new Promise((resolve, reject) => {
+      const signal = state.controller.signal;
+      let settled = false;
+      const finish = (error, blob) => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener('abort', cancel);
+        error ? reject(error) : resolve(blob);
+      };
+      const cancel = () => { finish(abortError()); state.transfer?.abort(); };
+      if (signal.aborted) { finish(abortError()); return; }
+      signal.addEventListener('abort', cancel, { once: true });
+      try {
+        state.transfer = GM_xmlhttpRequest({
+          method: 'GET', url, timeout: 120000, responseType: 'blob',
+          headers: { 'User-Agent': MOBILE_UA, Referer: 'https://www.douyin.com/' },
+          onprogress: response => {
+            if (settled || download !== state) return;
+            state.loaded = response.loaded || state.loaded;
+            state.total = response.total || state.total;
+            render();
+          },
+          onload: response => {
+            if (settled) return;
+            if (response.status !== 200 || !(response.response instanceof Blob) || response.response.size === 0) {
+              finish(new Error(`文件请求失败（HTTP ${response.status}）`)); return;
+            }
+            if (row) {
+              // 与逐张下载一致：以实际响应确认图片格式，而不是探测时的 HEAD 结果。
+              const extension = imageExtension(header(response, 'content-type') || response.response.type);
+              if (!extension || !mediaUrl(response.finalUrl || url)) {
+                finish(new Error('下载地址未返回允许的图片文件')); return;
+              }
+              row.extension = extension;
+            }
+            finish(null, response.response);
+          },
+          onerror: () => finish(new Error('文件传输失败，请重新探测后重试')),
+          ontimeout: () => finish(new Error('文件传输超时，请重试')),
+          onabort: () => finish(abortError()),
+        });
+      } catch (error) { finish(error); }
+    });
+  }
+
+  // 图片本身已是压缩格式，ZIP 采用 Store（不二次压缩）；文件名按 UTF-8 标志位写入。
+  const CRC_TABLE = (() => {
+    const table = new Uint32Array(256);
+    for (let i = 0; i < 256; i++) {
+      let value = i;
+      for (let bit = 0; bit < 8; bit++) value = value & 1 ? 0xEDB88320 ^ (value >>> 1) : value >>> 1;
+      table[i] = value >>> 0;
+    }
+    return table;
+  })();
+
+  function crc32(data) {
+    let crc = -1;
+    for (let i = 0; i < data.length; i++) crc = CRC_TABLE[(crc ^ data[i]) & 0xFF] ^ (crc >>> 8);
+    return (crc ^ -1) >>> 0;
+  }
+
+  function buildZip(entries) {
+    const encoder = new TextEncoder();
+    const now = new Date();
+    const dosTime = (now.getHours() << 11) | (now.getMinutes() << 5) | (now.getSeconds() >> 1);
+    const dosDate = ((Math.max(0, now.getFullYear() - 1980) & 0x7F) << 9) | ((now.getMonth() + 1) << 5) | now.getDate();
+    const chunks = [];
+    const central = [];
+    let offset = 0;
+    let centralSize = 0;
+    const push = bytes => { chunks.push(bytes); offset += bytes.length; };
+    for (const entry of entries) {
+      const name = encoder.encode(entry.name);
+      const data = entry.data;
+      const size = data.length;
+      if (size >= 0xFFFFFFFF) throw new Error('单张图片超过 4 GiB，无法打包');
+      const crc = crc32(data);
+      const headerOffset = offset;
+      const local = new Uint8Array(30 + name.length);
+      const view = new DataView(local.buffer);
+      view.setUint32(0, 0x04034B50, true);
+      view.setUint16(4, 20, true);
+      view.setUint16(6, 0x0800, true);
+      view.setUint16(10, dosTime, true);
+      view.setUint16(12, dosDate, true);
+      view.setUint32(14, crc, true);
+      view.setUint32(18, size, true);
+      view.setUint32(22, size, true);
+      view.setUint16(26, name.length, true);
+      local.set(name, 30);
+      push(local); push(data);
+      const directory = new Uint8Array(46 + name.length);
+      const dir = new DataView(directory.buffer);
+      dir.setUint32(0, 0x02014B50, true);
+      dir.setUint16(4, 20, true);
+      dir.setUint16(6, 20, true);
+      dir.setUint16(8, 0x0800, true);
+      dir.setUint16(12, dosTime, true);
+      dir.setUint16(14, dosDate, true);
+      dir.setUint32(16, crc, true);
+      dir.setUint32(20, size, true);
+      dir.setUint32(24, size, true);
+      dir.setUint16(28, name.length, true);
+      dir.setUint32(42, headerOffset, true);
+      directory.set(name, 46);
+      central.push(directory);
+      centralSize += directory.length;
+    }
+    // 条目数或总大小超出 ZIP 传统格式上限时直接放弃，避免生成损坏的压缩包。
+    if (entries.length > 0xFFFF || offset >= 0xFFFFFFFF) throw new Error('图片数量或体积过多，无法打包为 ZIP');
+    const centralOffset = offset;
+    for (const record of central) push(record);
+    const end = new Uint8Array(22);
+    const footer = new DataView(end.buffer);
+    footer.setUint32(0, 0x06054B50, true);
+    footer.setUint16(8, entries.length, true);
+    footer.setUint16(10, entries.length, true);
+    footer.setUint32(12, centralSize, true);
+    footer.setUint32(16, centralOffset, true);
+    push(end);
+    return new Blob(chunks, { type: 'application/zip' });
+  }
+
+  function saveZipBlob(name, blob, state) {
+    return new Promise((resolve, reject) => {
+      const signal = state.controller.signal;
+      let settled = false;
+      const finish = error => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener('abort', cancel);
+        error ? reject(error) : resolve();
+      };
+      const cancel = () => { finish(abortError()); state.task?.abort(); };
+      if (signal.aborted) { finish(abortError()); return; }
+      signal.addEventListener('abort', cancel, { once: true });
+      try {
+        state.task = GM_download({ url: blob, name, conflictAction: 'uniquify', saveAs: false,
+          ontimeout: () => finish(new Error('下载超时，请重试')),
+          onerror: error => finish(new Error(error?.error === 'not_whitelisted'
+            ? '请在油猴设置中允许 .zip 文件下载'
+            : `保存失败（${error?.error || '未知错误'}），请重试`)),
+          onload: () => finish() });
+      } catch (error) { finish(error); }
+    });
+  }
+
+  async function startZipDownload(item, rows) {
+    if (download) return;
+    // 点击时重新核对；打包内容固定为开始时的已识别图片，切换卡片不影响进行中的打包。
+    syncCurrent();
+    if (item.aweme_id !== activeId) return;
+    if (!rows.length) return;
+    const state = { kind: 'zip', phase: 'download', name: '', loaded: 0, total: 0, task: null, transfer: null,
+      controller: new AbortController(), cancelled: false, count: rows.length, completed: 0 };
+    download = state;
+    let message = '';
+    try {
+      const files = [];
+      for (const row of rows) {
+        if (state.controller.signal.aborted) throw abortError();
+        state.name = filename(item, row);
+        state.loaded = 0; state.total = row.size || 0;
+        state.phase = 'download';
+        render();
+        // 移动端地址下载前重新取签名；以实际响应确认图片格式。
+        const resolved = await measureImage(row.url, state.controller.signal);
+        if (state.controller.signal.aborted) throw abortError();
+        const resolvedRow = { ...row, ...resolved };
+        state.name = filename(item, resolvedRow);
+        state.total = resolved.size || state.total;
+        const blob = await fetchBlob(resolved.url, state, resolvedRow);
+        state.name = filename(item, resolvedRow);
+        state.total = blob.size; state.loaded = blob.size;
+        files.push({ name: state.name, data: new Uint8Array(await blob.arrayBuffer()) });
+        state.completed++;
+      }
+      if (state.controller.signal.aborted) throw abortError();
+      state.phase = 'pack'; state.name = ''; state.loaded = 0; state.total = 0;
+      render();
+      const zip = buildZip(files);
+      state.phase = 'save';
+      render();
+      await saveZipBlob(zipName(item), zip, state);
+      message = `ZIP 已交给浏览器保存：${state.completed} 张图片`;
+    } catch (error) {
+      const reason = state.cancelled ? '打包下载已取消'
+        : `打包下载失败：${state.phase === 'pack' ? '正在生成 ZIP' : state.name} · ${error.message}`;
+      message = state.phase === 'download' && state.count > 1
+        ? `${reason}（已完成 ${state.completed}/${state.count} 张）` : reason;
+    } finally {
+      if (download === state) {
+        download = null;
+        ui.downloadMessage.textContent = message;
+        render();
+      }
+    }
+  }
+
   function node(tag, text, className) {
     const element = document.createElement(tag);
     if (text !== undefined) element.textContent = text;
@@ -849,6 +1059,9 @@
     ui.all.hidden = !album || !state?.rows.length;
     ui.all.disabled = Boolean(download || state?.busy);
     ui.all.textContent = `下载${state?.rows.length === item?.images.length ? '全部' : '已识别'}图片（${state?.rows.length || 0} 张）`;
+    ui.zip.hidden = ui.all.hidden;
+    ui.zip.disabled = ui.all.disabled;
+    ui.zip.textContent = `下载为 ZIP（${state?.rows.length || 0} 张）`;
     ui.status.textContent = notice || (waiting
       ? '正在识别当前作品……'
       : state?.busy
@@ -880,7 +1093,28 @@
       : state.rows.length ? album ? '按图集顺序保存独立图片；尺寸来自作品数据，格式以文件响应为准。' : '重复直链已合并；分辨率未知时不会猜测画质。'
       : '当前作品未取得可下载文件，请检查登录状态和油猴跨域授权。';
     ui.cancel.hidden = !download;
-    if (download) ui.downloadMessage.textContent = `${download.count > 1 ? `[${download.completed + 1}/${download.count}] ` : ''}${download.name}：${humanSize(download.loaded)} / ${humanSize(download.total)}`;
+    if (download) {
+      ui.bar.hidden = false;
+      ui.bar.classList.toggle('packing', download.kind === 'zip' && download.phase !== 'download');
+      if (download.kind === 'zip' && download.phase === 'pack') {
+        ui.downloadMessage.textContent = `正在打包 ZIP…（已下载 ${download.completed}/${download.count} 张图片）`;
+      } else if (download.kind === 'zip' && download.phase === 'save') {
+        ui.downloadMessage.textContent = `打包完成，正在保存 ZIP（${download.count} 张图片）……`;
+      } else if (download.count > 1) {
+        ui.downloadMessage.textContent = `[${download.completed + 1}/${download.count}] ${download.name}：${humanSize(download.loaded)} / ${humanSize(download.total)}`;
+      } else {
+        ui.downloadMessage.textContent = `${download.name}：${humanSize(download.loaded)} / ${humanSize(download.total)}`;
+      }
+      // ZIP 下载阶段按 (已完成张数 + 当前张进度)/总数 换算；打包与保存阶段由条纹动画表示。
+      const current = download.total ? Math.min(1, download.loaded / download.total) : 0;
+      const ratio = download.kind === 'zip' && download.phase !== 'download' ? 1
+        : (download.completed + current) / download.count;
+      ui.fill.style.width = `${Math.round(Math.min(1, ratio) * 100)}%`;
+    } else {
+      ui.bar.hidden = true;
+      ui.bar.classList.remove('packing');
+      ui.fill.style.width = '0';
+    }
     placePanel();
   }
 
@@ -901,6 +1135,10 @@
       .title{color:#cbd0dc;max-height:72px;overflow:auto}
       table{width:100%;border-collapse:collapse;margin-top:12px;font-size:13px}th,td{text-align:left;border-bottom:1px solid #383c49;padding:9px 4px}small{display:block;color:#9fa9bc;font-size:11px}
       .hint{color:#a7aebc;font-size:12px}pre{white-space:pre-wrap;font-size:12px;color:#eeb2bb}details{margin-top:8px}.download{border-top:1px solid #383c49;margin-top:12px;padding-top:8px}
+      .bar{height:6px;background:#323644;border-radius:3px;margin:10px 0 2px;overflow:hidden}
+      .fill{height:100%;width:0;background:#5eb1ff;border-radius:3px;transition:width .15s ease}
+      .bar.packing .fill{width:100%;background:repeating-linear-gradient(90deg,#5eb1ff 0 12px,#3d8fd6 12px 24px);animation:zip-pack .7s linear infinite}
+      @keyframes zip-pack{to{background-position:24px 0}}
     `;
     const panel = node('section', undefined, 'panel'); panel.hidden = true;
     const head = node('div', undefined, 'head'); const heading = node('h2', '抖音视频下载'); head.append(heading);
@@ -915,16 +1153,24 @@
       const state = inspection;
       if (state?.item.kind === 'album' && !state.busy) void startDownload(state.item, state.rows);
     }); actions.append(all);
+    const zip = node('button', '下载为 ZIP'); zip.hidden = true;
+    zip.title = '把已识别的图片打包为一个 ZIP 压缩包保存';
+    zip.addEventListener('click', () => {
+      const state = inspection;
+      if (state?.item.kind === 'album' && !state.busy) void startZipDownload(state.item, state.rows);
+    }); actions.append(zip);
     const table = node('table'); const thead = node('thead'); const labels = node('tr');
     for (const label of ['档位', '分辨率', '真实大小', '']) labels.append(node('th', label));
     thead.append(labels); const rows = node('tbody'); table.append(thead, rows);
     const empty = node('p', undefined, 'hint');
     const diagnostics = node('details'); diagnostics.append(node('summary', '查看未成功的探测')); const errors = node('pre'); diagnostics.append(errors);
     const downloadArea = node('div', undefined, 'download'); const downloadMessage = node('p', '', 'hint');
+    const bar = node('div', undefined, 'bar'); bar.hidden = true;
+    const fill = node('div'); fill.className = 'fill'; bar.append(fill);
     const cancel = node('button', '取消下载'); cancel.addEventListener('click', () => {
       if (!download) return;
       download.cancelled = true; download.controller.abort();
-    }); downloadArea.append(downloadMessage, cancel);
+    }); downloadArea.append(downloadMessage, bar, cancel);
     panel.append(head, status, title, actions, table, empty, diagnostics, downloadArea);
     const icon = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
     icon.setAttribute('viewBox', '0 0 24 24'); icon.setAttribute('aria-hidden', 'true');
@@ -942,7 +1188,7 @@
       placePanel();
     });
     shadow.append(style, panel, button); document.documentElement.append(host);
-    ui = { panel, button, heading, column: labels.firstElementChild, status, title, stop, all, rows, empty, diagnostics, errors, downloadMessage, cancel };
+    ui = { panel, button, heading, column: labels.firstElementChild, status, title, stop, all, zip, rows, empty, diagnostics, errors, downloadMessage, bar, fill, cancel };
     addEventListener('resize', placePanel);
     GM_registerMenuCommand('下载当前视频或图集', () => button.click());
     syncCurrent = () => {
