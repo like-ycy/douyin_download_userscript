@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         抖音画质探测与下载
 // @namespace    douyin-quality-downloader
-// @version      0.1.8
-// @description  点击当前播放视频上的下载图标，自动探测画质并下载。
+// @version      0.2.0
+// @description  下载当前作品：视频画质探测、图集逐张或整组保存。
 // @author       like-ycy
 // @license      MIT
 // @homepageURL  https://github.com/like-ycy/douyin_download_userscript
@@ -24,6 +24,7 @@
 // @connect      bytecdn.cn
 // @connect      ibytedtos.com
 // @connect      byteimg.com
+// @connect      douyinpic.com
 // @license      MIT
 // ==/UserScript==
 
@@ -33,7 +34,7 @@
   const page = typeof unsafeWindow === 'undefined' ? window : unsafeWindow;
   const MOBILE_UA = 'com.ss.android.ugc.aweme/220701 (Linux; U; Android 11; en_US; Pixel 5; Build/RQ3A; Cronet/58.0.0.0)';
   const RATIOS = ['default', '1080p', '2k', '4k', '720p', '540p', '360p'];
-  const CDN_DOMAINS = ['douyinvod.com', 'bytecdn.cn', 'ibytedtos.com', 'byteimg.com'];
+  const CDN_DOMAINS = ['douyinvod.com', 'bytecdn.cn', 'ibytedtos.com', 'byteimg.com', 'douyinpic.com'];
   const items = new Map();
   let activeId = '';
   let inspection = null;
@@ -45,7 +46,7 @@
   let ui;
   let syncCurrent = () => {};
 
-  // 仅接受已知视频 CDN，不把页面中的任意地址交给扩展权限请求。
+  // 仅接受已知媒体 CDN，不把页面中的任意地址交给扩展权限请求。
   function mediaUrl(value) {
     try {
       const url = new URL(value);
@@ -67,24 +68,34 @@
 
   function rememberItem(value) {
     const id = workId(value?.aweme_id) || workId(value?.awemeId);
-    const video = value?.video;
-    if (!id || !video) return;
-    // 详情 API 为 snake_case；推荐页 RSC recommendAwemeList 为 camelCase。
+    if (!id) return;
+    // 详情 API 为 snake_case；推荐页 RSC / 卡片数据为 camelCase。
     const urls = list => Array.isArray(list) ? list.map(entry => typeof entry === 'string' ? entry : entry?.src).filter(url => typeof url === 'string') : [];
-    const address = video.play_addr || {
-      uri: video.uri, url_list: urls(video.playAddr), width: video.width, height: video.height,
-    };
-    if (typeof address.uri !== 'string' || !address.uri) return;
-    const rates = Array.isArray(video.bit_rate) ? video.bit_rate : (Array.isArray(video.bitRateList) ? video.bitRateList : []).map(rate => ({
-      bit_rate: rate.bitRate, is_h265: rate.isH265,
-      play_addr: { uri: rate.uri, url_list: urls(rate.playAddr), width: rate.width, height: rate.height },
-    }));
+    const images = Array.isArray(value.images) ? value.images.map((image, index) => ({
+      index: index + 1, width: image?.width || 0, height: image?.height || 0,
+      urls: urls(image?.url_list || image?.urlList).map(mediaUrl).filter(Boolean),
+    })) : [];
+    const album = images.length > 0 || Number(value.aweme_type ?? value.awemeType) === 68;
+    const video = value.video;
+    let normalizedVideo = null;
+    if (!album) {
+      if (!video) return;
+      const address = video.play_addr || {
+        uri: video.uri, url_list: urls(video.playAddr), width: video.width, height: video.height,
+      };
+      if (typeof address.uri !== 'string' || !address.uri) return;
+      const rates = Array.isArray(video.bit_rate) ? video.bit_rate : (Array.isArray(video.bitRateList) ? video.bitRateList : []).map(rate => ({
+        bit_rate: rate.bitRate, is_h265: rate.isH265,
+        play_addr: { uri: rate.uri, url_list: urls(rate.playAddr), width: rate.width, height: rate.height },
+      }));
+      normalizedVideo = { play_addr: address, bit_rate: rates, is_h265: video.is_h265,
+        play_addr_h264: video.play_addr_h264,
+        play_addr_265: video.play_addr_265 || { uri: video.uri, url_list: urls(video.playAddrH265), width: video.width, height: video.height } };
+    }
     items.delete(id);
     items.set(id, {
       aweme_id: id, desc: value.desc || '', author: { nickname: value.author?.nickname || value.authorInfo?.nickname || '' },
-      video: { play_addr: address, bit_rate: rates, is_h265: video.is_h265,
-        play_addr_h264: video.play_addr_h264,
-        play_addr_265: video.play_addr_265 || { uri: video.uri, url_list: urls(video.playAddrH265), width: video.width, height: video.height } },
+      kind: album ? 'album' : 'video', images, video: normalizedVideo,
     });
     if (items.size > 100) {
       const discard = [...items.keys()].find(key => key !== activeId);
@@ -96,7 +107,7 @@
     let count = 0;
     const visit = (value, depth) => {
       if (!value || typeof value !== 'object' || depth > 12 || ++count > 5000) return;
-      if ((value.aweme_id || value.awemeId) && value.video) {
+      if ((value.aweme_id || value.awemeId) && (value.video || Array.isArray(value.images) || Number(value.aweme_type ?? value.awemeType) === 68)) {
         rememberItem(value);
         return;
       }
@@ -215,19 +226,23 @@
     return Reflect.apply(originalOpen, this, args);
   };
 
-  function currentVideo() {
-    const visible = [...document.querySelectorAll('video')].map(video => {
-      const style = page.getComputedStyle?.(video);
+  function currentWork() {
+    const visible = elements => [...elements].map(element => {
+      const style = page.getComputedStyle?.(element);
       if (style && (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0')) return null;
-      const box = video.getBoundingClientRect();
+      const box = element.getBoundingClientRect();
       const width = Math.max(0, Math.min(innerWidth, box.right) - Math.max(0, box.left));
       const height = Math.max(0, Math.min(innerHeight, box.bottom) - Math.max(0, box.top));
       const area = width * height;
-      const activeCard = Boolean(video.closest('[data-e2e="feed-active-video"]'));
-      return { video, box, area, activeCard, score: area * (video.paused ? 1 : 2) };
+      const video = element.tagName === 'VIDEO' ? element : element.querySelector('video');
+      const activeCard = Boolean(element.closest('[data-e2e="feed-active-video"]'));
+      return { element, video, box, area, activeCard, score: area * (video && !video.paused ? 2 : 1) };
     }).filter(entry => entry && entry.area > 10000)
       .sort((a, b) => Number(b.activeCard) - Number(a.activeCard) || b.score - a.score);
-    return visible[0] || null;
+    // 图集的 video 只播放配乐，尺寸为零；以作品卡片定位，不依赖播放器画面。
+    const cards = [...document.querySelectorAll('[data-e2e-vid]')];
+    const videos = [...document.querySelectorAll('video')].filter(video => !video.closest('[data-e2e-vid]'));
+    return visible([...cards, ...videos])[0] || null;
   }
 
   function idFromLink(value) {
@@ -257,12 +272,12 @@
     return '';
   }
 
-  function currentId(active = currentVideo()) {
+  function currentId(active = currentWork()) {
     if (active) {
       const { video } = active;
-      const cardId = cardIdentity(video);
+      const cardId = cardIdentity(active.element);
       if (cardId) return cardId;
-      for (const src of [video.currentSrc, video.src, ...[...video.querySelectorAll('source')].map(source => source.src)]) {
+      for (const src of video ? [video.currentSrc, video.src, ...[...video.querySelectorAll('source')].map(source => source.src)] : []) {
         if (!src) continue;
         try {
           const id = workId(new URL(src).searchParams.get('__vid'));
@@ -271,6 +286,7 @@
           if (!safe) continue;
           const key = mediaKey(safe);
           for (const item of items.values()) {
+            if (!item.video) continue;
             const addresses = [item.video.play_addr, item.video.play_addr_h264, item.video.play_addr_265,
               ...(item.video.bit_rate || []).map(rate => rate.play_addr)];
             if (addresses.some(address => (address?.url_list || []).some(value => mediaUrl(value) && mediaKey(value) === key))) return item.aweme_id;
@@ -284,9 +300,25 @@
 
   function playbackChanged(before, after) {
     if (!before || !after) return before !== after;
-    return before.video !== after.video ||
+    return before.element !== after.element ||
       Boolean(before.source && after.source && before.source !== after.source) ||
       Boolean(before.id && after.id && before.id !== after.id);
+  }
+
+  function readCurrentItem(element, id) {
+    // 仅在点击时读取当前卡片的组件属性，补上脚本启动前已经加载的作品。
+    // 不遍历全站状态；祖先深度和作品 ID 都严格限定。
+    if (!element || !id) return;
+    try {
+      const key = Object.keys(element).find(name => name.startsWith('__reactFiber$'));
+      for (let fiber = element[key], depth = 0; fiber && depth < 20; fiber = fiber.return, depth++) {
+        for (const value of [fiber.memoizedProps?.item, fiber.memoizedProps?.slideData]) {
+          if ((workId(value?.aweme_id) || workId(value?.awemeId)) !== id) continue;
+          rememberItem(value);
+          if (items.has(id)) return;
+        }
+      }
+    } catch { /* 组件数据不可用时仍由页面内嵌数据和网络响应提供作品 */ }
   }
 
   function beginCurrentProbe() {
@@ -294,8 +326,9 @@
     if (inspection?.busy && inspection.id === activeId) { ui.panel.hidden = false; return; }
     notice = '';
     ui.panel.hidden = false;
+    readCurrentItem(currentPlayback?.element, activeId);
     pendingProbe = currentPlayback ? { ...currentPlayback, deadline: Date.now() + 10000 } : null;
-    if (!pendingProbe) notice = '没有找到当前视频画面，请先打开要下载的视频。';
+    if (!pendingProbe) notice = '没有找到当前作品，请先打开要下载的视频或图集。';
     syncCurrent();
     render();
   }
@@ -310,7 +343,7 @@
 
   function request(url, { method = 'GET', range, signal } = {}) {
     if (!mediaUrl(url) && !url.startsWith('https://aweme.snssdk.com/aweme/v1/play/?')) {
-      return Promise.reject(new Error('该地址不属于允许的视频域名'));
+      return Promise.reject(new Error('该地址不属于允许的媒体域名'));
     }
     return new Promise((resolve, reject) => {
       if (signal?.aborted) { reject(abortError()); return; }
@@ -346,7 +379,7 @@
               task?.abort();
             }
           },
-          ontimeout: () => finish(new Error('视频请求超时')),
+          ontimeout: () => finish(new Error('媒体请求超时')),
           onabort: () => finish(abortError()),
         });
       } catch (error) { finish(error); }
@@ -456,13 +489,60 @@
     });
   }
 
+  function imageExtension(type) {
+    const extensions = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif', 'image/avif': 'avif' };
+    const mime = (type || '').split(';')[0].trim().toLowerCase();
+    return Object.hasOwn(extensions, mime) ? extensions[mime] : '';
+  }
+
+  async function measureImage(url, signal) {
+    // 图片 CDN 可能忽略 Range；HEAD 只取头，不为探测下载整张图片。
+    const response = await request(url, { method: 'HEAD', signal });
+    if (response.status !== 200) throw new Error(`图片服务器返回 HTTP ${response.status}`);
+    const extension = imageExtension(header(response, 'content-type'));
+    if (!extension) throw new Error('图片地址未返回支持的图片格式');
+    const final = mediaUrl(response.finalUrl || url);
+    if (!final) throw new Error('图片地址不属于允许的媒体域名');
+    return { url: final, size: responseSize(response), extension };
+  }
+
+  async function inspectAlbum(item, state, signal) {
+    for (const image of item.images) {
+      if (signal.aborted) break;
+      let result;
+      let errorMessage = '没有可用的图片地址';
+      // 优先 JPEG，保持页面提供的完整签名；失败才尝试同张图片的其他节点/格式。
+      const urls = [...new Set(image.urls)].sort((a, b) =>
+        Number(/\.jpe?g$/i.test(new URL(b).pathname)) - Number(/\.jpe?g$/i.test(new URL(a).pathname)));
+      for (const url of urls) {
+        try { result = await measureImage(url, signal); break; }
+        catch (error) {
+          if (error.name === 'AbortError') return;
+          errorMessage = error.message;
+        }
+      }
+      if (result) state.rows.push({ ...result, kind: 'image', index: image.index,
+        label: `图片 ${image.index}`, width: image.width, height: image.height });
+      else state.errors.push(`图片 ${image.index}：${errorMessage}`);
+      render();
+    }
+    if (!item.images.length) state.errors.push('当前图集尚未提供图片列表，请重新打开下载面板。');
+  }
+
   async function inspect(item) {
     inspectController?.abort();
     const controller = new AbortController();
     inspectController = controller;
-    const state = { id: item.aweme_id, rows: [], errors: [], busy: true };
+    const state = { id: item.aweme_id, item, rows: [], errors: [], busy: true };
     inspection = state;
     render();
+    if (item.kind === 'album') {
+      await inspectAlbum(item, state, controller.signal);
+      state.busy = false;
+      if (inspectController === controller) inspectController = null;
+      render();
+      return;
+    }
     const seen = new Map();
     // default 必须先尝试；网页的转码档位可在移动接口失败时继续使用。
     const candidates = [...RATIOS.map(ratio => ({ ratio, label: ratio === 'default' ? 'default · 原始播放档' : ratio })), ...pageQualities(item)];
@@ -535,78 +615,130 @@
     const quality = row.ratio === 'default' ? 'default'
       : validDimension(row.width) && validDimension(row.height) ? `${row.width}x${row.height}` : '未知尺寸';
     const codec = clipFilename(cleanFilenamePart(row.codec), 16, 32);
-    const suffix = ` - ${quality}${codec ? ` ${codec}` : ''}.mp4`;
+    const suffix = row.kind === 'image'
+      ? ` - 图片${String(row.index).padStart(3, '0')}.${row.extension}`
+      : ` - ${quality}${codec ? ` ${codec}` : ''}.mp4`;
     // 整个文件名（含画质后缀和扩展名）同时限制 UTF-16 长度与 UTF-8 字节数。
     const budget = 200 - new TextEncoder().encode(suffix).length;
     base = clipFilename(base, 120 - suffix.length, budget) || 'douyin_video';
     return base + suffix;
   }
 
-  async function startDownload(item, row) {
-    if (download) return;
-    // 点击时重新核对，避免刷到下一条后轮询尚未更新而下载上一条。
-    syncCurrent();
-    if (item.aweme_id !== activeId) return;
-    const state = { name: filename(item, row), loaded: 0, total: row.size, task: null, controller: new AbortController(), cancelled: false };
-    download = state;
-    ui.downloadMessage.textContent = '正在准备下载……';
-    render();
-    const finish = message => {
-      if (download !== state) return;
-      download = null;
-      ui.downloadMessage.textContent = message;
-      render();
-    };
-    const options = {
-      name: state.name,
-      conflictAction: 'uniquify',
-      saveAs: false,
-      onprogress: progress => {
-        state.loaded = progress.loaded || state.loaded;
-        state.total = progress.total || state.total;
-        render();
-      },
-      onload: () => finish(`${GM_info.downloadMode === 'browser' ? '下载完成' : '已交给浏览器保存，请查看下载列表'}：${state.name}`),
-      ontimeout: () => finish('下载超时，请重试'),
-      onerror: error => {
-        const hints = { not_enabled: '请在油猴设置中开启下载功能', not_whitelisted: '请在油猴设置中允许 mp4 文件下载', not_permitted: '请授予油猴下载权限', not_supported: '当前浏览器不支持油猴下载' };
-        finish(state.cancelled ? '下载已取消' : hints[error?.error] || `下载失败（${error?.error || '网络错误'}），请重新探测后重试`);
-      },
-    };
-    try {
-      // 移动端档位下载前重新取签名，避免沿用过期地址。
-      const resolved = row.ratio ? await probe(item.video.play_addr.uri, row.ratio, state.controller.signal) : await measure(row.url, state.controller.signal);
-      if (state.cancelled) return;
-      state.total = resolved.size || state.total;
-      if (GM_info.downloadMode === 'browser') {
-        // Chrome 下载 API 禁止 User-Agent；先由油猴跨域请求带移动端 UA 拉取，再保存 Blob。
+  function saveDownload(item, row, resolved, state) {
+    return new Promise((resolve, reject) => {
+      const signal = state.controller.signal;
+      let settled = false;
+      const finish = error => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener('abort', cancel);
+        error ? reject(error) : resolve();
+      };
+      const cancel = () => {
+        finish(abortError());
+        state.transfer?.abort(); state.task?.abort();
+      };
+      if (signal.aborted) { finish(abortError()); return; }
+      signal.addEventListener('abort', cancel, { once: true });
+      const options = {
+        conflictAction: 'uniquify', saveAs: false,
+        onprogress: progress => {
+          if (settled || download !== state) return;
+          state.loaded = progress.loaded || state.loaded;
+          state.total = progress.total || state.total;
+          render();
+        },
+        onload: () => finish(),
+        ontimeout: () => finish(new Error('下载超时，请重试')),
+        onerror: error => {
+          const extension = row.kind === 'image' ? resolved.extension : 'mp4';
+          const hints = { not_enabled: '请在油猴设置中开启下载功能',
+            not_whitelisted: `请在油猴设置中允许 .${extension} 文件下载`,
+            not_permitted: '请授予油猴下载权限', not_supported: '当前浏览器不支持油猴下载' };
+          finish(new Error(hints[error?.error] || `保存失败（${error?.error || '网络错误'}），请重新探测后重试`));
+        },
+      };
+      const save = url => {
+        if (settled) return;
+        try {
+          state.task = GM_download({ url, name: state.name,
+            ...(typeof url === 'string' ? { headers: { 'User-Agent': MOBILE_UA, Referer: 'https://www.douyin.com/' } } : {}),
+            ...options });
+        } catch (error) { finish(error); }
+      };
+      try {
+        if (GM_info.downloadMode !== 'browser') { save(resolved.url); return; }
+        // Chrome 下载 API 禁止 User-Agent；由油猴取回单个文件后交给浏览器保存。
         state.transfer = GM_xmlhttpRequest({
           method: 'GET', url: resolved.url, timeout: 120000, responseType: 'blob',
           headers: { 'User-Agent': MOBILE_UA, Referer: 'https://www.douyin.com/' },
           onprogress: options.onprogress,
           onload: response => {
-            if (state.cancelled) return;
+            if (settled) return;
             if (response.status !== 200 || !(response.response instanceof Blob) || response.response.size === 0) {
-              finish(`下载请求失败（HTTP ${response.status}）`);
-              return;
+              finish(new Error(`文件请求失败（HTTP ${response.status}）`)); return;
+            }
+            if (row.kind === 'image') {
+              const extension = imageExtension(header(response, 'content-type') || response.response.type);
+              if (!extension || !mediaUrl(response.finalUrl || resolved.url)) {
+                finish(new Error('下载地址未返回允许的图片文件')); return;
+              }
+              resolved.extension = extension;
+              state.name = filename(item, { ...row, extension });
             }
             state.total = response.response.size;
             state.loaded = response.response.size;
             render();
-            state.task = GM_download({ url: response.response, ...options });
+            save(response.response);
           },
-          onerror: () => finish('文件传输失败，请确认 CDN 直链仍有效'),
-          ontimeout: () => finish('文件传输超时，请重试'),
-          onabort: () => { if (state.cancelled) finish('下载已取消'); },
+          onerror: () => finish(new Error('文件传输失败，请重新探测后重试')),
+          ontimeout: () => finish(new Error('文件传输超时，请重试')),
+          onabort: () => finish(abortError()),
         });
-      } else {
-        state.task = GM_download({
-          url: resolved.url,
-          headers: { 'User-Agent': MOBILE_UA, Referer: 'https://www.douyin.com/' },
-          ...options,
-        });
+      } catch (error) { finish(error); }
+    });
+  }
+
+  async function startDownload(item, selection) {
+    if (download) return;
+    // 点击时重新核对；整组队列固定作品和顺序，切换卡片不改变已开始的下载。
+    syncCurrent();
+    if (item.aweme_id !== activeId) return;
+    const rows = Array.isArray(selection) ? [...selection] : [selection];
+    if (!rows.length) return;
+    const state = { name: '', loaded: 0, total: 0, task: null, transfer: null,
+      controller: new AbortController(), cancelled: false, count: rows.length, completed: 0 };
+    download = state;
+    let message = '';
+    try {
+      for (const row of rows) {
+        if (state.controller.signal.aborted) throw abortError();
+        state.name = filename(item, row);
+        state.loaded = 0; state.total = row.size; state.task = null; state.transfer = null;
+        render();
+        // 移动端档位下载前重新取签名；图片单独验证格式，不走视频播放接口。
+        const resolved = row.kind === 'image' ? await measureImage(row.url, state.controller.signal)
+          : row.ratio ? await probe(item.video.play_addr.uri, row.ratio, state.controller.signal)
+          : await measure(row.url, state.controller.signal);
+        if (state.controller.signal.aborted) throw abortError();
+        state.name = filename(item, { ...row, ...resolved });
+        state.total = resolved.size || state.total;
+        await saveDownload(item, row, resolved, state);
+        state.completed++;
       }
-    } catch (error) { finish(state.cancelled ? '下载已取消' : error.message); }
+      const done = GM_info.downloadMode === 'browser' ? '下载完成' : '已交给浏览器保存，请查看下载列表';
+      message = state.count > 1 ? `${done}：${state.completed} 张图片` : `${done}：${state.name}`;
+    } catch (error) {
+      const reason = state.cancelled ? '下载已取消' : `下载失败：${state.name} · ${error.message}`;
+      const progress = GM_info.downloadMode === 'browser' ? '已完成' : '已提交';
+      message = state.count > 1 ? `${reason}（${progress} ${state.completed}/${state.count} 张）` : reason;
+    } finally {
+      if (download === state) {
+        download = null;
+        ui.downloadMessage.textContent = message;
+        render();
+      }
+    }
   }
 
   function node(tag, text, className) {
@@ -707,24 +839,31 @@
 
   function render() {
     if (!ui) return;
-    const item = items.get(activeId);
-    const state = inspection?.id === item?.aweme_id ? inspection : null;
+    const state = inspection?.id === activeId ? inspection : null;
+    const item = state?.item || items.get(activeId);
+    const album = item?.kind === 'album';
     const waiting = Boolean(pendingProbe);
+    ui.heading.textContent = album ? '抖音图集下载' : '抖音视频下载';
+    ui.column.textContent = album ? '图片' : '档位';
     ui.stop.hidden = !state?.busy && !waiting;
+    ui.all.hidden = !album || !state?.rows.length;
+    ui.all.disabled = Boolean(download || state?.busy);
+    ui.all.textContent = `下载${state?.rows.length === item?.images.length ? '全部' : '已识别'}图片（${state?.rows.length || 0} 张）`;
     ui.status.textContent = notice || (waiting
-      ? '正在识别当前视频并获取画质……'
+      ? '正在识别当前作品……'
       : state?.busy
-      ? `正在探测画质 · 已找到 ${state.rows.length} 个版本`
+      ? album ? `正在读取图集 · 已找到 ${state.rows.length}/${item.images.length} 张图片` : `正在探测画质 · 已找到 ${state.rows.length} 个版本`
       : download
       ? '下载进行中'
       : item
-      ? `${item.author?.nickname || '作者未知'} · ${state ? '画质探测完成' : '点击视频上的下载图标开始探测'}`
-      : '点击视频上的下载图标，自动识别并探测当前作品。');
+      ? `${item.author?.nickname || '作者未知'} · ${state ? album ? `已识别 ${state.rows.length}/${item.images.length} 张图片` : '画质探测完成' : '点击下载图标开始探测'}`
+      : '点击下载图标，自动识别当前视频或图集。');
     ui.title.textContent = item?.desc || '';
     ui.rows.replaceChildren();
     for (const row of state?.rows || []) {
       const tr = node('tr');
       const quality = node('td', row.label);
+      if (row.kind === 'image') quality.append(node('small', row.extension.toUpperCase()));
       if (row.codec) quality.append(node('small', `${row.codec}${row.bitrate ? ` · ${(row.bitrate / 1e6).toFixed(2)} Mbps` : ''}`));
       tr.append(quality, node('td', row.width && row.height ? `${row.width} × ${row.height}` : '未知'), node('td', humanSize(row.size)));
       const action = node('td');
@@ -736,12 +875,12 @@
     ui.diagnostics.hidden = !state?.errors.length;
     ui.errors.textContent = state?.errors.join('\n') || '';
     ui.empty.textContent = !state
-      ? waiting ? '收到当前视频详情后会自动开始探测。' : '点击当前视频旁的下载图标开始探测。'
-      : state.busy ? '正在读取当前视频的播放版本和文件大小……'
-      : state.rows.length ? '重复直链已合并；分辨率未知时不会猜测画质。'
-      : '当前视频未取得可下载版本，请检查登录状态和油猴跨域授权。';
+      ? waiting ? '收到当前作品数据后会自动开始探测。' : '点击当前作品旁的下载图标开始探测。'
+      : state.busy ? album ? '正在读取图片格式和文件大小……' : '正在读取当前视频的播放版本和文件大小……'
+      : state.rows.length ? album ? '按图集顺序保存独立图片；尺寸来自作品数据，格式以文件响应为准。' : '重复直链已合并；分辨率未知时不会猜测画质。'
+      : '当前作品未取得可下载文件，请检查登录状态和油猴跨域授权。';
     ui.cancel.hidden = !download;
-    if (download) ui.downloadMessage.textContent = `${download.name}：${humanSize(download.loaded)} / ${humanSize(download.total)}`;
+    if (download) ui.downloadMessage.textContent = `${download.count > 1 ? `[${download.completed + 1}/${download.count}] ` : ''}${download.name}：${humanSize(download.loaded)} / ${humanSize(download.total)}`;
     placePanel();
   }
 
@@ -764,13 +903,18 @@
       .hint{color:#a7aebc;font-size:12px}pre{white-space:pre-wrap;font-size:12px;color:#eeb2bb}details{margin-top:8px}.download{border-top:1px solid #383c49;margin-top:12px;padding-top:8px}
     `;
     const panel = node('section', undefined, 'panel'); panel.hidden = true;
-    const head = node('div', undefined, 'head'); head.append(node('h2', '抖音视频下载'));
+    const head = node('div', undefined, 'head'); const heading = node('h2', '抖音视频下载'); head.append(heading);
     const status = node('p');
     const title = node('p', undefined, 'title');
     const actions = node('div', undefined, 'actions');
     const stop = node('button', '停止探测'); stop.addEventListener('click', () => {
       pendingProbe = null; notice = '已停止探测'; inspectController?.abort(); render();
     }); actions.append(stop);
+    const all = node('button', '下载全部图片'); all.hidden = true;
+    all.addEventListener('click', () => {
+      const state = inspection;
+      if (state?.item.kind === 'album' && !state.busy) void startDownload(state.item, state.rows);
+    }); actions.append(all);
     const table = node('table'); const thead = node('thead'); const labels = node('tr');
     for (const label of ['档位', '分辨率', '真实大小', '']) labels.append(node('th', label));
     thead.append(labels); const rows = node('tbody'); table.append(thead, rows);
@@ -779,8 +923,7 @@
     const downloadArea = node('div', undefined, 'download'); const downloadMessage = node('p', '', 'hint');
     const cancel = node('button', '取消下载'); cancel.addEventListener('click', () => {
       if (!download) return;
-      download.cancelled = true; download.controller.abort(); download.transfer?.abort(); download.task?.abort(); download = null;
-      downloadMessage.textContent = '下载已取消'; render();
+      download.cancelled = true; download.controller.abort();
     }); downloadArea.append(downloadMessage, cancel);
     panel.append(head, status, title, actions, table, empty, diagnostics, downloadArea);
     const icon = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
@@ -788,7 +931,7 @@
     const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
     path.setAttribute('d', 'M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3'); icon.append(path);
     const button = node('button', undefined, 'video-action');
-    button.type = 'button'; button.title = '点击下载当前视频，拖动调整位置'; button.setAttribute('aria-label', '探测并下载当前视频'); button.append(icon);
+    button.type = 'button'; button.title = '点击下载当前视频或图集，拖动调整位置'; button.setAttribute('aria-label', '下载当前视频或图集'); button.append(icon);
     const dragging = enableIconDragging(button, placePanel);
     button.addEventListener('click', event => {
       event.preventDefault(); event.stopPropagation();
@@ -799,15 +942,15 @@
       placePanel();
     });
     shadow.append(style, panel, button); document.documentElement.append(host);
-    ui = { panel, button, status, title, stop, rows, empty, diagnostics, errors, downloadMessage, cancel };
+    ui = { panel, button, heading, column: labels.firstElementChild, status, title, stop, all, rows, empty, diagnostics, errors, downloadMessage, cancel };
     addEventListener('resize', placePanel);
-    GM_registerMenuCommand('下载当前视频', () => button.click());
+    GM_registerMenuCommand('下载当前视频或图集', () => button.click());
     syncCurrent = () => {
-      const video = currentVideo();
-      const id = currentId(video);
-      const playback = video ? {
-        video: video.video,
-        source: video.video.currentSrc || video.video.src || video.video.querySelectorAll('source')[0]?.src || '',
+      const work = currentWork();
+      const id = currentId(work);
+      const playback = work ? {
+        element: work.element,
+        source: work.element.tagName === 'VIDEO' ? work.video.currentSrc || work.video.src || work.video.querySelector('source')?.src || '' : '',
         id,
       } : null;
       const changed = playbackChanged(currentPlayback, playback);
@@ -819,8 +962,8 @@
         inspectController?.abort(); inspectController = null; inspection = null;
         panel.hidden = true;
       }
-      if (video) {
-        dragging.update(video);
+      if (work) {
+        dragging.update(work);
         ui.button.hidden = false;
       } else {
         ui.button.hidden = true;
@@ -828,7 +971,7 @@
       if (pendingProbe) {
         if (pendingProbe.deadline <= Date.now()) {
           pendingProbe = null;
-          notice = '未能读取当前视频卡片的数据。请刷新抖音页面后重试。';
+          notice = '未能读取当前作品卡片的数据。请刷新抖音页面后重试。';
           render();
         } else {
           const item = items.get(id);
