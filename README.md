@@ -11,10 +11,12 @@
 **视频下载示例**
 
 ![视频下载示例：面板跟随下载图标弹出，展示各档位画质、分辨率与真实大小](assets/panel-example.png)
+![视频下载示例(外链图片)：面板跟随下载图标弹出，展示各档位画质、分辨率与真实大小](https://greasyfork.org/rails/active_storage/blobs/redirect/eyJfcmFpbHMiOnsiZGF0YSI6MzE3NjE3LCJwdXIiOiJibG9iX2lkIn19--f10d61ad62633568ef46adb3aaa5ed4b9e933fe1/Snipaste_2026-10-13_20-51-47.png?locale=zh-CN)
 
 **图集下载示例**
 
 ![图集下载示例：展示图片顺序、格式、分辨率与真实大小，支持单张或全部下载](assets/panel-example2.png)
+![图集下载示例(外链图片)：展示图片顺序、格式、分辨率与真实大小，支持单张或全部下载](https://greasyfork.org/rails/active_storage/blobs/redirect/eyJfcmFpbHMiOnsiZGF0YSI6MzE3NzMxLCJwdXIiOiJibG9iX2lkIn19--4873ce69f8dcca7b4078dc4a6fe1d7f0e26e713c/ScreenShot_2026-10-14_165210_489%20(1).png?locale=zh-CN)
 
 ## 功能
 
