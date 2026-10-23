@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         抖音画质探测与下载
 // @namespace    douyin-quality-downloader
-// @version      0.4.0
+// @version      0.4.1
 // @description  下载当前作品：视频画质探测、图集与苹果实况照片逐张、整组保存或打包为 ZIP。
 // @author       like-ycy
 // @license      MIT
@@ -664,65 +664,56 @@
   }
 
   function zipName(item) {
-    const base = clipFilename(baseName(item, `douyin_${workId(item.aweme_id) || 'album'}`), 120, 190) || 'douyin_images';
-    return `${base}.zip`;
+    const suffix = '.zip';
+    const base = clipFilename(baseName(item, `douyin_${workId(item.aweme_id) || 'album'}`), 120 - suffix.length, 200 - suffix.length) || 'douyin_images';
+    return base + suffix;
   }
 
-  function saveDownload(item, row, resolved, state) {
-    return new Promise((resolve, reject) => {
-      const signal = state.controller.signal;
-      let settled = false;
-      const finish = error => {
-        if (settled) return;
-        settled = true;
-        signal.removeEventListener('abort', cancel);
-        error ? reject(error) : resolve();
-      };
-      const cancel = () => {
-        finish(abortError());
-        state.transfer?.abort(); state.task?.abort();
-      };
-      if (signal.aborted) { finish(abortError()); return; }
-      signal.addEventListener('abort', cancel, { once: true });
-      const options = {
-        conflictAction: 'uniquify', saveAs: false,
-        onprogress: progress => {
-          if (settled || download !== state) return;
-          state.loaded = progress.loaded || state.loaded;
-          state.total = progress.total || state.total;
-          render();
-        },
-        onload: () => finish(),
-        ontimeout: () => finish(new Error('下载超时，请重试')),
-        onerror: error => {
-          const extension = row.kind === 'image' ? resolved.extension : 'mp4';
-          const hints = { not_enabled: '请在油猴设置中开启下载功能',
-            not_whitelisted: `请在油猴设置中允许 .${extension} 文件下载`,
-            not_permitted: '请授予油猴下载权限', not_supported: '当前浏览器不支持油猴下载' };
-          finish(new Error(hints[error?.error] || `保存失败（${error?.error || '网络错误'}），请重新探测后重试`));
-        },
-      };
-      const save = url => {
-        if (settled) return;
-        try {
-          state.task = GM_download({ url, name: state.name,
-            ...(typeof url === 'string' ? { headers: { 'User-Agent': MOBILE_UA, Referer: 'https://www.douyin.com/' } } : {}),
-            ...options });
-        } catch (error) { finish(error); }
-      };
-      try {
-        if (GM_info.downloadMode !== 'browser') { save(resolved.url); return; }
-        // 普通下载和 ZIP 使用同一个传输入口验证响应与取消状态。
-        const resolvedRow = { ...row, ...resolved };
-        fetchBlob(resolved.url, state, resolvedRow).then(blob => {
-          if (settled) return;
-          resolved.extension = resolvedRow.extension;
-          state.name = filename(item, resolvedRow);
-          state.total = blob.size; state.loaded = blob.size;
-          render(); save(blob);
-        }, finish);
-      } catch (error) { finish(error); }
-    });
+  // 下载配置在面板与任务入口共用；只提供操作指引，不修改油猴全局设置。
+  const DOWNLOAD_SETUP = '油猴图标 → 管理面板 → 设置 → 配置模式「高级」→ 下载模式「原生（Native）」→ 保存，再刷新抖音页面';
+
+  function downloadSetup() {
+    if (GM_info.downloadMode === 'disabled') {
+      return { error: `油猴下载功能未开启。请按以下步骤设置：${DOWNLOAD_SETUP}` };
+    }
+    if (typeof GM_download !== 'function') {
+      return { error: '油猴下载接口不可用，请更新 Tampermonkey 并确认本脚本已启用，再刷新页面' };
+    }
+    const hint = GM_info.downloadMode === 'browser'
+      ? `当前为「浏览器 API」下载模式。若文件名变成 UUID（一串随机字母和数字），请设置：${DOWNLOAD_SETUP}`
+      : GM_info.downloadMode === 'native'
+      ? '当前为「原生」下载模式。保存结果请查看浏览器下载列表；已提交的文件需在下载列表中取消。'
+      : `无法识别当前下载模式。如保存异常，请设置：${DOWNLOAD_SETUP}`;
+    return { error: '', hint };
+  }
+
+  function downloadError(error, name) {
+    const extension = name.split('.').pop();
+    const detail = typeof error?.details === 'string' ? error.details : error?.details?.current;
+    if (detail === 'USER_CANCELED') return abortError();
+    const hints = {
+      not_enabled: `油猴下载功能未开启。请设置：${DOWNLOAD_SETUP}`,
+      not_whitelisted: `请在油猴「管理面板 → 设置 → 配置模式：高级 → 下载」的文件扩展名允许列表中加入 .${extension}，保存后刷新页面`,
+      not_permitted: '请按油猴提示授予下载权限；若未弹出提示，请在油猴设置中重新选择下载模式并保存，然后刷新页面',
+      not_supported: '当前环境不支持油猴下载，请更新桌面 Chrome / Edge 和 Tampermonkey 后重试',
+    };
+    const reason = typeof detail === 'string' ? `：${detail.slice(0, 160)}` : '';
+    return new Error(hints[error?.error] || `保存失败（${error?.error || '未知错误'}${reason}），请先查看浏览器下载列表；若未保存，再重新探测并重试`);
+  }
+
+  async function saveDownload(item, row, resolved, state) {
+    if (GM_info.downloadMode !== 'browser') {
+      await saveFile(state.name, resolved.url, state);
+      return;
+    }
+    // 普通下载和 ZIP 使用同一个传输入口验证响应与取消状态。
+    const resolvedRow = { ...row, ...resolved };
+    const blob = await fetchBlob(resolved.url, state, resolvedRow);
+    if (state.controller.signal.aborted) throw abortError();
+    state.name = filename(item, resolvedRow);
+    state.total = blob.size; state.loaded = blob.size;
+    render();
+    await saveFile(state.name, blob, state);
   }
 
   async function startDownload(item, selection) {
@@ -737,6 +728,8 @@
     download = state;
     let message = '';
     try {
+      const setupError = downloadSetup().error;
+      if (setupError) throw new Error(setupError);
       for (const row of rows) {
         if (state.controller.signal.aborted) throw abortError();
         state.name = filename(item, row);
@@ -746,7 +739,7 @@
           const entries = await albumFiles(item, row, state);
           if (state.controller.signal.aborted) throw abortError();
           state.name = filename(item, row);
-          await saveZipBlob(state.name, buildZip(entries), state);
+          await saveFile(state.name, buildZip(entries), state);
           state.completed++;
           continue;
         }
@@ -763,7 +756,7 @@
       const done = GM_info.downloadMode === 'browser' ? '下载完成' : '已交给浏览器保存，请查看下载列表';
       message = state.count > 1 ? `${done}：${state.completed} 张图片` : `${done}：${state.name}`;
     } catch (error) {
-      const reason = state.cancelled ? '下载已取消' : `下载失败：${state.name} · ${error.message}`;
+      const reason = state.cancelled || error.name === 'AbortError' ? '下载已取消' : `下载失败：${state.name} · ${error.message}`;
       const progress = GM_info.downloadMode === 'browser' ? '已完成' : '已提交';
       message = state.count > 1 ? `${reason}（${progress} ${state.completed}/${state.count} 张）` : reason;
     } finally {
@@ -1152,26 +1145,35 @@
     return new Blob(chunks, { type: 'application/zip' });
   }
 
-  function saveZipBlob(name, blob, state) {
+  function saveFile(name, source, state) {
     return new Promise((resolve, reject) => {
       const signal = state.controller.signal;
       let settled = false;
+      let task;
       const finish = error => {
         if (settled) return;
         settled = true;
         signal.removeEventListener('abort', cancel);
+        if (state.task === task) state.task = null;
         error ? reject(error) : resolve();
       };
-      const cancel = () => { finish(abortError()); state.task?.abort(); };
+      const cancel = () => { finish(abortError()); task?.abort(); };
       if (signal.aborted) { finish(abortError()); return; }
       signal.addEventListener('abort', cancel, { once: true });
       try {
-        state.task = GM_download({ url: blob, name, conflictAction: 'uniquify', saveAs: false,
-          ontimeout: () => finish(new Error('下载超时，请重试')),
-          onerror: error => finish(new Error(error?.error === 'not_whitelisted'
-            ? '请在油猴设置中允许 .zip 文件下载'
-            : `保存失败（${error?.error || '未知错误'}），请重试`)),
+        task = GM_download({ url: source, name, conflictAction: 'uniquify', saveAs: false,
+          ...(typeof source === 'string' ? { headers: { 'User-Agent': MOBILE_UA, Referer: 'https://www.douyin.com/' } } : {}),
+          onprogress: progress => {
+            if (settled || download !== state) return;
+            state.loaded = progress.loaded || state.loaded;
+            state.total = progress.total || state.total;
+            render();
+          },
+          ontimeout: () => finish(new Error('保存超时，请查看浏览器下载列表后重试')),
+          onerror: error => finish(downloadError(error, name)),
           onload: () => finish() });
+        if (signal.aborted) task?.abort();
+        else if (!settled) state.task = task;
       } catch (error) { finish(error); }
     });
   }
@@ -1187,6 +1189,8 @@
     download = state;
     let message = '';
     try {
+      const setupError = downloadSetup().error;
+      if (setupError) throw new Error(setupError);
       const files = [];
       for (const row of rows) {
         if (state.controller.signal.aborted) throw abortError();
@@ -1201,15 +1205,16 @@
       state.phase = 'pack'; state.name = ''; state.loaded = 0; state.total = 0;
       render();
       const zip = buildZip(files);
-      state.phase = 'save';
+      state.phase = 'save'; state.name = zipName(item);
       render();
-      await saveZipBlob(zipName(item), zip, state);
-      message = `ZIP 已交给浏览器保存：${state.completed} 张图片`;
+      await saveFile(state.name, zip, state);
+      message = GM_info.downloadMode === 'browser' ? `ZIP 下载完成：${state.completed} 张图片`
+        : `ZIP 已交给浏览器保存：${state.completed} 张图片，请查看下载列表`;
     } catch (error) {
-      const reason = state.cancelled ? '打包下载已取消'
+      const reason = state.cancelled || error.name === 'AbortError' ? '打包下载已取消'
         : `打包下载失败：${state.phase === 'pack' ? '正在生成 ZIP' : state.name} · ${error.message}`;
       message = state.phase === 'download' && state.count > 1
-        ? `${reason}（已完成 ${state.completed}/${state.count} 张）` : reason;
+        ? `${reason}（已读取 ${state.completed}/${state.count} 张，尚未保存 ZIP）` : reason;
     } finally {
       if (download === state) {
         download = null;
@@ -1322,11 +1327,13 @@
     const album = item?.kind === 'album';
     const hasLive = Boolean(item?.images.some(image => image.live));
     const waiting = Boolean(pendingProbe);
+    const setup = downloadSetup();
+    ui.setupHint.textContent = setup.error || setup.hint;
     ui.heading.textContent = album ? '抖音图集下载' : '抖音视频下载';
     ui.column.textContent = album ? '图片' : '档位';
     ui.stop.hidden = !state?.busy && !waiting;
     ui.all.hidden = !album || !state?.rows.length;
-    ui.all.disabled = Boolean(download || state?.busy);
+    ui.all.disabled = Boolean(download || state?.busy || setup.error);
     ui.all.textContent = `下载${state?.rows.length === item?.images.length ? '全部' : '已识别'}${hasLive ? '' : '图片'}（${state?.rows.length || 0} 张）`;
     ui.zip.hidden = ui.all.hidden;
     ui.zip.disabled = ui.all.disabled;
@@ -1351,12 +1358,12 @@
       tr.append(quality, node('td', row.width && row.height ? `${row.width} × ${row.height}` : '未知'), node('td', humanSize(row.size)));
       const action = node('td');
       const button = node('button', row.kind === 'live' ? '下载实况' : '下载');
-      button.disabled = Boolean(download);
+      button.disabled = Boolean(download || setup.error);
       button.addEventListener('click', () => startDownload(item, row));
       action.append(button);
       if (row.kind === 'live') {
         const still = node('button', '静态图');
-        still.disabled = Boolean(download);
+        still.disabled = Boolean(download || setup.error);
         still.addEventListener('click', () => startDownload(item, row.photo));
         action.append(still);
       }
@@ -1423,6 +1430,7 @@
     const head = node('div', undefined, 'head'); const heading = node('h2', '抖音视频下载'); head.append(heading);
     const status = node('p');
     const title = node('p', undefined, 'title');
+    const setupHint = node('p', undefined, 'hint');
     const actions = node('div', undefined, 'actions');
     const stop = node('button', '停止探测'); stop.addEventListener('click', () => {
       pendingProbe = null; notice = '已停止探测'; inspectController?.abort(); render();
@@ -1450,7 +1458,7 @@
       if (!download) return;
       download.cancelled = true; download.controller.abort();
     }); downloadArea.append(downloadMessage, bar, cancel);
-    panel.append(head, status, title, actions, table, empty, diagnostics, downloadArea);
+    panel.append(head, status, title, setupHint, actions, table, empty, diagnostics, downloadArea);
     const icon = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
     icon.setAttribute('viewBox', '0 0 24 24'); icon.setAttribute('aria-hidden', 'true');
     const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
@@ -1467,7 +1475,7 @@
       placePanel();
     });
     shadow.append(style, panel, button); document.documentElement.append(host);
-    ui = { panel, button, heading, column: labels.firstElementChild, status, title, stop, all, zip, rows, empty, diagnostics, errors, downloadMessage, bar, fill, cancel };
+    ui = { panel, button, heading, column: labels.firstElementChild, status, title, setupHint, stop, all, zip, rows, empty, diagnostics, errors, downloadMessage, bar, fill, cancel };
     addEventListener('resize', placePanel);
     GM_registerMenuCommand('下载当前视频或图集', () => button.click());
     syncCurrent = () => {
