@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         抖音画质探测与下载
 // @namespace    douyin-quality-downloader
-// @version      0.4.1
+// @version      0.4.2
 // @description  下载当前作品：视频画质探测、图集与苹果实况照片逐张、整组保存或打包为 ZIP。
 // @author       like-ycy
 // @license      MIT
@@ -320,13 +320,18 @@
   }
 
   function readCurrentItem(element, id) {
-    // 仅在点击时读取当前卡片的组件属性，补上脚本启动前已经加载的作品。
-    // 不遍历全站状态；祖先深度和作品 ID 都严格限定。
+    // 仅在用户发起的识别期间读取当前作品，补上启动前已加载或随后挂载的组件数据。
+    // 详情页 VIDEO 由播放器创建，React 数据在上层容器；DOM 和组件祖先均限制深度。
     if (!element || !id) return;
     try {
-      const key = Object.keys(element).find(name => name.startsWith('__reactFiber$'));
-      for (let fiber = element[key], depth = 0; fiber && depth < 20; fiber = fiber.return, depth++) {
-        for (const value of [fiber.memoizedProps?.item, fiber.memoizedProps?.slideData]) {
+      let fiber;
+      for (let node = element, depth = 0; node && depth < 10; node = node.parentElement, depth++) {
+        const key = Object.keys(node).find(name => name.startsWith('__reactFiber$'));
+        if (key) { fiber = node[key]; break; }
+      }
+      for (let depth = 0; fiber && depth < 20; fiber = fiber.return, depth++) {
+        const props = fiber.memoizedProps;
+        for (const value of [props?.item, props?.slideData, props?.awemeInfo]) {
           if ((workId(value?.aweme_id) || workId(value?.awemeId)) !== id) continue;
           rememberItem(value);
           if (items.has(id)) return;
@@ -340,7 +345,6 @@
     if (inspection?.busy && inspection.id === activeId) { ui.panel.hidden = false; return; }
     notice = '';
     ui.panel.hidden = false;
-    readCurrentItem(currentPlayback?.element, activeId);
     pendingProbe = currentPlayback ? { ...currentPlayback, deadline: Date.now() + 10000 } : null;
     if (!pendingProbe) notice = '没有找到当前作品，请先打开要下载的视频或图集。';
     syncCurrent();
@@ -1507,6 +1511,7 @@
           notice = '未能读取当前作品卡片的数据。请刷新抖音页面后重试。';
           render();
         } else {
+          readCurrentItem(work?.element, id);
           const item = items.get(id);
           if (item) {
             pendingProbe = null;
